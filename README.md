@@ -1,5 +1,11 @@
 # postmarketOS Deployment Walkthrough: Samsung Galaxy A52s 5G (samsung-a52sxq)
 
+## Preamble to guide below
+
+Note to reader: this guide has been automatically generated with the purpose of sharing learnings from turning a Samsung Galaxy A52s into a postmarketOS server.
+
+---
+
 This guide walks you through turning your Samsung Galaxy A52s 5G into a headless postmarketOS server.
 
 It details the workarounds for critical hardware and firmware constraints encountered when installing custom operating systems on modern Samsung Qualcomm devices.
