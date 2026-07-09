@@ -42,7 +42,7 @@ The bootloader must be completely unlocked before the device will accept custom 
 
 ## 3. The Core Challenge: Boot Image Header Version 2 & Flash Offsets
 
-Modern Samsung devices using the Qualcomm SM7325 chipset (Snapdragon 778G) boot with strict boot image layout expectations. Setting up `samsung-a52sxq` (which is archived/unmaintained in the main `pmaports` tree) requires modifying two key configuration files inside the pmaports directory:
+Modern Samsung devices using the Qualcomm SM7325 chipset (Snapdragon 778G) boot with strict boot image layout expectations. Setting up `samsung-a52sxq` (which is archived/unmaintained in the main `pmaports` tree) requires modifying two key configuration files inside the pmaports directory on your **Host PC**:
 `~/.local/var/pmbootstrap/cache_git/pmaports/device/archived/device-samsung-a52sxq/`
 
 ### A. Adjusting `deviceinfo`
@@ -230,11 +230,97 @@ fi
 
 ## 8. WLAN & IPA Firmware Dependencies
 
-The Snapdragon 778G connectivity stack uses the `icnss2` kernel driver for the QCA6750 Wi-Fi chip, which depends on the Qualcomm IPA (Internet Processor Accelerator) subsystem.
-* **Symptom**: If the kernel logs (`dmesg`) show a repeating loop of:
-  ```
-  subsys-pil-tz soc:qcom,ipa_fws: yupik_ipa_fws: Initializing image failed(rc:-22)
-  subsys-pil-tz: subsys_powerup(): pil_boot failed for yupik_ipa_fws
-  ```
-  The IPA subsystem will fail to start, and the `wlan0` interface will not register.
-* **Resolution**: Extract the stock, uncorrupted proprietary firmware blobs (`yupik_ipa_fws.*` files) from the device's stock `vendor` partition (located in `/vendor/firmware/`) and place them in the phone's `/lib/firmware/` directory.
+The Snapdragon 778G chipset relies on two proprietary subsystems for networking to function:
+1. **IPA (Internet Processor Accelerator)**: Handles hardware-accelerated packet routing.
+2. **WPSS (Wireless Processor Subsystem)**: Drives the QCA6750 Wi-Fi chip via the `icnss2` kernel driver.
+
+Without staging the correct proprietary firmware blobs and automating the subsystem boot handshakes, the wireless stack will remain inactive.
+
+---
+
+### A. Extracting Stock Firmware Blobs
+
+Android 10+ devices package logical partitions (like `/vendor`) inside a physical `super` partition (`/dev/sda26`). Since the mainline kernel does not map these partitions automatically:
+
+1. **Locate the Super physical partition** (usually `/dev/sda26` on the A52s).
+2. **Unpack the logical vendor image** directly on the device using `lpunpack`:
+   ```bash
+   sudo lpunpack -p vendor /dev/sda26 /tmp/vendor_extract
+   ```
+3. **Mount the ext4 vendor image** to access its filesystem:
+   ```bash
+   sudo mkdir -p /mnt/vendor
+   sudo mount -o loop,ro /tmp/vendor_extract/vendor.img /mnt/vendor
+   ```
+4. **Copy the IPA and WPSS firmware files** to the system's firmware directory:
+   ```bash
+   sudo cp /mnt/vendor/firmware/yupik_ipa_fws.* /lib/firmware/
+   sudo cp /mnt/vendor/firmware/wpss.* /lib/firmware/
+   ```
+5. **Clean up** by unmounting the loop image and deleting the unpacked partition file:
+   ```bash
+   sudo umount /mnt/vendor
+   sudo rm -rf /tmp/vendor_extract
+   ```
+
+---
+
+### B. Automating the WPSS Boot & MAC Address Handshake
+
+On mainline Linux, the WLAN driver (`icnss2`) requires a manual subsystem boot and a MAC address injection before it registers the `wlan0` interface. We handle this dynamically on every boot using an OpenRC local startup script.
+
+> [!NOTE]
+> The MAC address `00:03:7f:12:67:67` used below is a generic placeholder. You can replace it with your device's actual factory MAC address (found on the box, in stock Android settings, or on your router's lease history) or any valid custom MAC address.
+
+1. **Create the local startup script** at `/etc/local.d/wifi.start`:
+   ```bash
+   sudo sh -c 'cat > /etc/local.d/wifi.start << "EOF"
+   #!/bin/sh
+   # Wait for the system/devices to settle
+   sleep 2
+
+   # Write 1 to WPSS boot to trigger processor startup
+   if [ -f /sys/devices/platform/soc/17a10040.qcom,wcn6750/wpss_boot ]; then
+       echo 1 > /sys/devices/platform/soc/17a10040.qcom,wcn6750/wpss_boot
+   fi
+
+   # Set MAC address to satisfy macloader interface and register wlan0
+   if [ -f /sys/wifi/mac_addr ]; then
+       echo "00:03:7f:12:67:67" > /sys/wifi/mac_addr
+   fi
+
+   # Wait for wlan0 interface registration
+   for i in $(seq 1 10); do
+       if ip link show wlan0 >/dev/null 2>&1; then
+           break
+       fi
+       sleep 1
+   done
+
+   # Restart wpa_supplicant to bind to wlan0
+   rc-service wpa_supplicant restart
+
+   # Bring up wlan0
+   ifup wlan0
+   EOF'
+   ```
+2. **Make the script executable**:
+   ```bash
+   sudo chmod +x /etc/local.d/wifi.start
+   ```
+
+---
+
+### C. Bypassing the Fresh-Boot MTU Drop Bug
+
+On a fresh boot, the QCA6750 Wi-Fi driver suffers from a bug where it silently drops TCP/ICMP packets larger than **~1150 bytes**. During SSH key exchange (KEX), host keys exceeding this limit are sent, causing connections to hang at `expecting SSH2_MSG_KEX_ECDH_REPLY` and time out.
+
+**Resolution**: Set the MTU of the `wlan0` interface to `1100`. This forces TCP connections to negotiate a smaller Maximum Segment Size (MSS) of `1060` bytes, bypassing the packet-dropping threshold.
+
+Modify `/etc/network/interfaces` on the device:
+```text
+auto wlan0
+iface wlan0 inet dhcp
+    mtu 1100
+```
+This guarantees the interface automatically initializes with the correct MTU on boot, ensuring SSH connections remain fast and stable.

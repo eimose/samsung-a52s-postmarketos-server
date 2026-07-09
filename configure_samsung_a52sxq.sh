@@ -126,28 +126,120 @@ if [ -f ~/.bashrc ]; then
 fi
 EOF'
 
-# Step 4: Configure Wi-Fi connection
+# Step 4: Configure Wi-Fi & Firmware
 echo ""
-echo ">>> [4/4] Configuring Wi-Fi network..."
+echo ">>> [4/4] Configuring Wi-Fi network and staging firmware..."
 read -p "Would you like to connect the phone to Wi-Fi? (y/n): " CONNECT_WIFI
 if [[ "$CONNECT_WIFI" =~ ^[Yy]$ ]]; then
     read -p "  Enter Wi-Fi SSID: " WIFI_SSID
     read -sp "  Enter Wi-Fi Password: " WIFI_PASS
     echo ""
     
-    # Auto-detect interface
-    WIFI_IFACE=$(ssh user@"$PHONE_IP" "ip -o link show | awk -F': ' '{print \$2}' | grep -E '^wl' | head -n 1" || echo "wlan0")
-    if [ -z "$WIFI_IFACE" ]; then WIFI_IFACE="wlan0"; fi
-    
-    echo "  Connecting phone using interface $WIFI_IFACE to $WIFI_SSID..."
-    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S nmcli device wifi connect '$WIFI_SSID' password '$WIFI_PASS' ifname $WIFI_IFACE"
-    
-    echo "  Disabling Wi-Fi power saving..."
-    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S nmcli connection modify id '$WIFI_SSID' 802-11-wireless.powersave 2"
-    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S nmcli connection up id '$WIFI_SSID'"
-    
-    echo "  Checking Wi-Fi IP address..."
-    ssh user@"$PHONE_IP" "ip address show dev $WIFI_IFACE | grep inet"
+    # 1. Firmware Check and Extraction
+    echo "  Checking for proprietary connectivity firmware..."
+    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c '
+        if [ ! -f /lib/firmware/wpss.mdt ] || [ ! -f /lib/firmware/yupik_ipa_fws.mdt ]; then
+            echo \"  -> Staging firmware from logical vendor partition...\"
+            if [ -f /dev/sda26 ]; then
+                mkdir -p /tmp/vendor_extract /mnt/vendor
+                lpunpack -p vendor /dev/sda26 /tmp/vendor_extract
+                mount -o loop,ro /tmp/vendor_extract/vendor.img /mnt/vendor
+                cp /mnt/vendor/firmware/yupik_ipa_fws.* /lib/firmware/
+                cp /mnt/vendor/firmware/wpss.* /lib/firmware/
+                umount /mnt/vendor
+                rm -rf /tmp/vendor_extract
+                echo \"  ✓ Firmware extracted successfully.\"
+            else
+                echo \"  ERROR: /dev/sda26 (super partition) not found. Cannot extract stock firmware.\"
+                exit 1
+            fi
+        else
+            echo \"  ✓ Firmware blobs already present.\"
+        fi
+    '"
+
+    # 2. Configure NetworkManager to ignore wlan0
+    echo "  Configuring NetworkManager to unmanage wlan0..."
+    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c '
+        mkdir -p /etc/NetworkManager/conf.d
+        cat > /etc/NetworkManager/conf.d/unmanage-wlan0.conf << \"EOF\"
+[keyfile]
+unmanaged-devices=interface-name:wlan0
+EOF
+    '"
+
+    # 3. Create wpa_supplicant configuration
+    echo "  Configuring wpa_supplicant..."
+    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c '
+        cat > /etc/conf.d/wpa_supplicant << \"EOF\"
+wpa_supplicant_if=\"wlan0\"
+wpa_supplicant_args=\"-Dnl80211,wext -dd\"
+output_log=\"/var/log/wpa_supplicant.log\"
+error_log=\"/var/log/wpa_supplicant.log\"
+EOF
+
+        cat > /etc/wpa_supplicant/wpa_supplicant.conf << \"EOF\"
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+
+network={
+    ssid=\"$WIFI_SSID\"
+    psk=\"$WIFI_PASS\"
+    key_mgmt=WPA-PSK
+}
+EOF
+        chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+    '"
+
+    # 4. Create /etc/network/interfaces with MTU 1100 workaround
+    echo "  Configuring /etc/network/interfaces (with MTU 1100 fix)..."
+    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c '
+        cat > /etc/network/interfaces << \"EOF\"
+auto lo
+iface lo inet loopback
+
+auto wlan0
+iface wlan0 inet dhcp
+    mtu 1100
+EOF
+    '"
+
+    # 5. Create local startup script to boot WPSS and inject MAC address
+    echo "  Creating OpenRC local startup script..."
+    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c '
+        cat > /etc/local.d/wifi.start << \"EOF\"
+#!/bin/sh
+sleep 2
+if [ -f /sys/devices/platform/soc/17a10040.qcom,wcn6750/wpss_boot ]; then
+    echo 1 > /sys/devices/platform/soc/17a10040.qcom,wcn6750/wpss_boot
+fi
+if [ -f /sys/wifi/mac_addr ]; then
+    echo \"00:03:7f:12:67:67\" > /sys/wifi/mac_addr
+fi
+for i in \$(seq 1 10); do
+    if ip link show wlan0 >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+rc-service wpa_supplicant restart
+ifup wlan0
+EOF
+        chmod +x /etc/local.d/wifi.start
+    '"
+
+    # 6. Enable services and bring up interface
+    echo "  Enabling services and connecting..."
+    ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c '
+        rc-update add local default >/dev/null 2>&1 || true
+        rc-update add networking default >/dev/null 2>&1 || true
+        rc-service local restart
+    '"
+
+    # 7. Check lease IP
+    echo "  Waiting for Wi-Fi association and DHCP lease..."
+    sleep 5
+    ssh user@"$PHONE_IP" "ip address show dev wlan0 | grep inet" || echo "  Warning: wlan0 has not acquired an IP yet. It may take up to 10 seconds."
 fi
 
 echo ""
