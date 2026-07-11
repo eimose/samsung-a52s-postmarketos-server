@@ -324,3 +324,63 @@ iface wlan0 inet dhcp
     mtu 1100
 ```
 This guarantees the interface automatically initializes with the correct MTU on boot, ensuring SSH connections remain fast and stable.
+
+---
+
+## 9. Framebuffer Display Console & Status Dashboard
+
+### A. The Console Driver Limitation
+In the downstream Android kernel configuration for the A52s, the framebuffer console driver is compiled out:
+```text
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
+```
+Because of this:
+* Native text consoles (like `agetty` or `/dev/tty1`) cannot map console printouts onto the graphical screen.
+* The screen will remain black/blank after the early bootloader splash animation disappears, even though the display panel is powered on.
+
+### B. Accessing raw Framebuffer `/dev/fb0` & Stride Pitch
+Although the text console driver is disabled, the graphics hardware is fully operational. You can render graphics, text, or dashboards by writing pixels directly to `/dev/fb0`.
+
+> [!IMPORTANT]
+> The physical screen size is $1080 \times 2400$ pixels with a 32-bit (4 bytes) color depth. However, the display controller enforces a row stride (pitch alignment) of **`4352` bytes** per row instead of the raw $1080 \times 4 = 4320 \text{ bytes}$.
+> 
+> When writing raw pixel buffers, you **must** pad the end of each row by 32 bytes (8 pixels), calculating indices as:
+> `idx = (y * 4352) + (x * 4)`
+> Failing to align rows to the 4352-byte stride will cause the display to show diagonal skewing, shearing, and color distortion.
+
+---
+
+## 10. Flashing Gotchas & Recovery Procedures
+
+Through repeated deployment cycles, several recurring issues have been identified and resolved:
+
+### A. `pmbootstrap` Root Execution Restriction
+* **Gotcha**: Prefixing the build/flash script with `sudo` (e.g., `sudo ./rebuild_and_flash_a52s.sh`) causes `pmbootstrap` to abort with `Do not run pmbootstrap as root!`.
+* **Fix**: Run `sudo true` first to cache root credentials in your terminal environment, then run the script *without* sudo:
+  ```bash
+  sudo true && ./rebuild_and_flash_a52s.sh
+  ```
+
+### B. OpenRC Boot Hang via `hwclock`
+* **Gotcha**: The Snapdragon 778G mainline kernel's RTC driver does not trigger the clock ticks queried by the busybox `hwclock` tool on boot, causing the service to block indefinitely and preventing SSH from starting.
+* **Fix**: Remove `hwclock` from the boot sequence in your rootfs (the device uses NTP via `chronyd` to manage system clocks instead):
+  ```bash
+  rc-update del hwclock boot
+  ```
+
+### C. Host UID Ownership Leak
+* **Gotcha**: Extracting or mapping filesystems inside host user namespaces can cause files (specifically `/var/empty`) to acquire the host user's UID/GID (usually `1000`) instead of `0` (`root`). SSH will check ownership and reject connections if privilege-separation folders are writable or owned by non-root users.
+* **Fix**: Mount the rootfs in recovery mode and force-reassign permissions:
+  ```bash
+  find /mnt/pmos -user 1000 -exec chown -h 0 {} +
+  find /mnt/pmos -group 1000 -exec chgrp -h 0 {} +
+  ```
+
+### D. setuid Permission Bits Stripping
+* **Gotcha**: Re-assigning ownership or copying rootfs configurations recursively strips the **setuid** bit from system binaries. This breaks `sudo` and `passwd` commands (dropping them from `4755` to `0755` permissions).
+* **Fix**: Explicitly restore the setuid bit to these critical binaries inside recovery:
+  ```bash
+  chmod 4755 /mnt/pmos/usr/bin/sudo
+  chmod 4755 /mnt/pmos/usr/bin/passwd
+  ```
+

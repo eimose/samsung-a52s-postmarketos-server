@@ -15,11 +15,17 @@ echo " Headless Node Configurator — postmarketOS (Galaxy A52s 5G)"
 echo "============================================================"
 echo ""
 
-read -p "Enter phone IP address [$DEFAULT_IP]: " PHONE_IP
-PHONE_IP=${PHONE_IP:-$DEFAULT_IP}
+PHONE_IP="${1:-}"
+if [ -z "$PHONE_IP" ]; then
+    read -p "Enter phone IP address [$DEFAULT_IP]: " PHONE_IP
+    PHONE_IP=${PHONE_IP:-$DEFAULT_IP}
+fi
 
-read -p "Enter SSH password [$DEFAULT_PASS]: " PHONE_PASS
-PHONE_PASS=${PHONE_PASS:-$DEFAULT_PASS}
+PHONE_PASS="${2:-}"
+if [ -z "$PHONE_PASS" ]; then
+    read -p "Enter SSH password [$DEFAULT_PASS]: " PHONE_PASS
+    PHONE_PASS=${PHONE_PASS:-$DEFAULT_PASS}
+fi
 
 # Clear old SSH host key if it exists
 ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$PHONE_IP" 2>/dev/null || true
@@ -50,17 +56,9 @@ else
     ssh-copy-id -o StrictHostKeyChecking=no -i "$PUB_KEY" user@"$PHONE_IP"
 fi
 
-# Step 2: Install terminal packages on the phone
+# Step 2: Configure shell settings, colors, aliases, and screen power controls
 echo ""
-echo ">>> [2/4] Installing btop, neofetch, bash, and bash-completion..."
-ssh -o StrictHostKeyChecking=no user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c 'yes | apk add bash bash-completion btop neofetch'"
-
-# Step 3: Configure shell settings, colors, aliases, and screen power controls
-echo ""
-echo ">>> [3/4] Customizing shell environment (~/.bashrc, ~/.bash_profile)..."
-
-# Change default shell to bash
-ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S chsh -s /bin/bash user"
+echo ">>> [2/4] Customizing shell environment (~/.bashrc, ~/.bash_profile)..."
 
 # Generate local temporary bashrc config with auto-backlight detection
 TMP_BASHRC="/tmp/phone_bashrc_$$"
@@ -126,14 +124,24 @@ if [ -f ~/.bashrc ]; then
 fi
 EOF'
 
-# Step 4: Configure Wi-Fi & Firmware
+# Step 3: Configure Wi-Fi & Firmware
 echo ""
-echo ">>> [4/4] Configuring Wi-Fi network and staging firmware..."
-read -p "Would you like to connect the phone to Wi-Fi? (y/n): " CONNECT_WIFI
+echo ">>> [3/4] Configuring Wi-Fi network and staging firmware..."
+CONNECT_WIFI="${5:-}"
+if [ -z "$CONNECT_WIFI" ]; then
+    read -p "Would you like to connect the phone to Wi-Fi? (y/n): " CONNECT_WIFI
+fi
+
 if [[ "$CONNECT_WIFI" =~ ^[Yy]$ ]]; then
-    read -p "  Enter Wi-Fi SSID: " WIFI_SSID
-    read -sp "  Enter Wi-Fi Password: " WIFI_PASS
-    echo ""
+    WIFI_SSID="${3:-}"
+    if [ -z "$WIFI_SSID" ]; then
+        read -p "  Enter Wi-Fi SSID: " WIFI_SSID
+    fi
+    WIFI_PASS="${4:-}"
+    if [ -z "$WIFI_PASS" ]; then
+        read -sp "  Enter Wi-Fi Password: " WIFI_PASS
+        echo ""
+    fi
     
     # 1. Firmware Check and Extraction
     echo "  Checking for proprietary connectivity firmware..."
@@ -224,6 +232,10 @@ for i in \$(seq 1 10); do
 done
 rc-service wpa_supplicant restart
 ifup wlan0
+sleep 2
+if ! ip route | grep -q default; then
+    ip route add default via 192.168.18.1 dev wlan0 2>/dev/null || true
+fi
 EOF
         chmod +x /etc/local.d/wifi.start
     '"
@@ -241,6 +253,15 @@ EOF
     sleep 5
     ssh user@"$PHONE_IP" "ip address show dev wlan0 | grep inet" || echo "  Warning: wlan0 has not acquired an IP yet. It may take up to 10 seconds."
 fi
+
+# Step 4: Install terminal packages on the phone (now that Wi-Fi is online)
+echo ""
+echo ">>> [4/4] Installing btop, neofetch, bash, and bash-completion..."
+ssh -o StrictHostKeyChecking=no user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S sh -c 'yes | apk add bash bash-completion btop neofetch'"
+
+# Change default shell to bash now that bash is installed
+echo "  Changing default shell to bash..."
+ssh user@"$PHONE_IP" "echo '$PHONE_PASS' | sudo -S chsh -s /bin/bash user"
 
 echo ""
 echo "============================================================"
